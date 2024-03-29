@@ -122,3 +122,8 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+.idea/
+/credentials.json
+/token.json
+/saved_start_page_token.json
