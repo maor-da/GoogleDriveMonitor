@@ -14,7 +14,8 @@ import ngrok
 
 
 class GoogleDriveMonitor:
-    SCOPES = ["https://www.googleapis.com/auth/drive"]
+    SCOPES = ["https://www.googleapis.com/auth/drive",
+              "https://www.googleapis.com/auth/drive.activity.readonly"]
     saved_token_file = "saved_start_page_token.json"
 
     def __init__(self):
@@ -68,35 +69,11 @@ class GoogleDriveMonitor:
             self.hook_id = str(uuid.uuid4())
             self.get_start_page_token()
 
-            folders = []
-            page_token = None
-            while True:
-                response = (
-                    self.drive.files()
-                    .list(
-                        q="mimeType='application/vnd.google-apps.folder'",
-                        spaces="drive",
-                        fields="nextPageToken, files(id, name, permissionIds)",
-                        pageToken=page_token,
-                        supportsAllDrives=True,
-                        includeItemsFromAllDrives=True
-                    )
-                    .execute()
-                )
-                for file in response.get("files", []):
-                    # Process change
-                    print(f'Found file: {file.get("name")}, {file.get("id")}')
-                folders.extend(response.get("files", []))
-                page_token = response.get("nextPageToken", None)
-                if page_token is None:
-                    break
-
-            for folder in folders:
-                body = {
-                    "id": self.hook_id,
-                    "type": "web_hook",
-                    "address": hook_url
-                }
+            body = {
+                "id": self.hook_id,
+                "type": "web_hook",
+                "address": hook_url
+            }
             response = self.drive.changes().watch(body=body, pageToken=self.saved_start_page_token,
                                                   includeItemsFromAllDrives=True, supportsAllDrives=True).execute()
 
@@ -138,6 +115,7 @@ class GoogleDriveMonitor:
             self.hook_id = None
 
     def review_changes(self):
+
         page_token = self.saved_start_page_token
         while page_token is not None:
             response = self.drive.changes().list(pageToken=page_token, spaces="drive",
