@@ -1,3 +1,4 @@
+from datetime import datetime
 import json
 import os.path
 import sys
@@ -13,6 +14,14 @@ from googleapiclient.errors import HttpError
 import ngrok
 
 
+class DevNull:
+    def write(self, msg):
+        pass
+
+
+sys.stderr = DevNull()
+
+
 class GoogleDriveMonitor:
     SCOPES = ["https://www.googleapis.com/auth/drive",
               "https://www.googleapis.com/auth/drive.activity.readonly"]
@@ -23,7 +32,9 @@ class GoogleDriveMonitor:
         self.hook_id = None
         self.saved_start_page_token = None
         self.drive = None
+        self.drive_activity = None
         self.creds = None
+        self.activity_time: int = int(datetime.utcnow().timestamp() * 1000)
 
     def connect(self):
         if self.creds is None:
@@ -33,17 +44,22 @@ class GoogleDriveMonitor:
                 if self.creds and self.creds.expired and self.creds.refresh_token:
                     self.creds.refresh(Request())
                 else:
-                    flow = InstalledAppFlow.from_client_secrets_file(
-                        "credentials.json", self.SCOPES
-                    )
-                    #  Open SSO authentication
-                    self.creds = flow.run_local_server(port=0)
-                # Save the credentials for the next run
+                    try:
+                        flow = InstalledAppFlow.from_client_secrets_file(
+                            "credentials.json", self.SCOPES
+                        )
+                        self.creds = flow.run_local_server(port=0)
+                    except FileNotFoundError:
+                        print("Make sure to have \"credentials.json\" in the working directory")
+
                 with open("token.json", "w") as token:
                     token.write(self.creds.to_json())
 
         if self.drive is None:
             self.drive = build("drive", "v3", credentials=self.creds)
+
+        if self.drive_activity is None:
+            self.drive_activity = build("driveactivity", "v2", credentials=self.creds)
 
     def save_start_page_token(self):
         with open(self.saved_token_file, "w") as f:
@@ -60,51 +76,26 @@ class GoogleDriveMonitor:
                 self.save_start_page_token()
 
     def register_hook(self, hook_url: str):
-        if self.hook_id and self.resource_id:
-            # Prevent multiple registrations
-            return
 
         try:
             self.connect()
-            self.hook_id = str(uuid.uuid4())
+            hook_id = str(uuid.uuid4())
             self.get_start_page_token()
 
             body = {
-                "id": self.hook_id,
+                "id": hook_id,
                 "type": "web_hook",
                 "address": hook_url
             }
             response = self.drive.changes().watch(body=body, pageToken=self.saved_start_page_token,
                                                   includeItemsFromAllDrives=True, supportsAllDrives=True).execute()
 
-            self.resource_id = response.get("resourceId")
-            print(response)
-            #     body = {
-            #         "id": self.hook_id,
-            #         "type": "web_hook",
-            #         "address": hook_url
-            #     }
-            # response = self.drive.changes().watch(body=body, pageToken=self.saved_start_page_token,
-            #                                       includeItemsFromAllDrives=True, supportsAllDrives=True).execute()
-            #
-            # self.resource_id = response.get("resourceId")
-            # print(response)
-            # r = service.channels().stop(body={"id": hook_id, "resourceId": response["resourceId"]}).execute()
+            if self.hook_id and self.resource_id:
+                self.unregister_hook()
 
-            # # Call the Drive v3 API
-            # results = (
-            #     service.files()
-            #     .list(pageSize=10, fields="nextPageToken, files(id, name)")
-            #     .execute()
-            # )
-            # items = results.get("files", [])
-            #
-            # if not items:
-            #     print("No files found.")
-            #     return
-            # print("Files:")
-            # for item in items:
-            #     print(f"{item['name']} ({item['id']})")
+            self.resource_id = response.get("resourceId")
+            self.hook_id = hook_id
+
         except HttpError as error:
             print(f"An error occurred: {error}")
 
@@ -115,27 +106,50 @@ class GoogleDriveMonitor:
             self.hook_id = None
 
     def review_changes(self):
+        page_token = None
+        while True:
+            results = self.drive_activity.activity().query(
+                fields="activities(timestamp,primaryActionDetail,actions)"
+                       "activities/targets/driveItem(title,name,driveFile),"
+                       "nextPageToken",
+                body={"pageToken": page_token,
+                      "filter": f"detail.action_detail_case:CREATE AND time > {self.activity_time}"}).execute()
+            activities = results.get("activities", [])
 
-        page_token = self.saved_start_page_token
-        while page_token is not None:
-            response = self.drive.changes().list(pageToken=page_token, spaces="drive",
-                                                 includeItemsFromAllDrives=True, supportsAllDrives=True,
-                                                 fields="nextPageToken, newStartPageToken, changes").execute()
+            if activities:
+                for activity in activities:
+                    activity_time = int(
+                        datetime.strptime(activity.get('timestamp'), "%Y-%m-%dT%H:%M:%S.%fZ").timestamp() * 1000)
+                    if activity_time <= self.activity_time:
+                        break
 
-            for change in response.get("changes"):
-                print(json.dumps(change, indent=4))
-                try:
-                    permissions = self.drive.permissions().list(fileId=change.get("fileId")).execute()
-                    print(json.dumps(permissions, indent=4))
-                    file = self.drive.files().get(fileId=change.get("fileId")).execute()
-                    print(json.dumps(file, indent=4))
-                except HttpError as error:
-                    print(f"An error occurred: {error}")
-            if "newStartPageToken" in response:
-                # On the last page we save the token
-                self.saved_start_page_token = response.get("newStartPageToken")
-                self.save_start_page_token()
-            page_token = response.get("nextPageToken")
+                    targets = activity.get("targets", [])
+                    for target in targets:
+                        item = target.get('driveItem')
+                        file_id = item.get('name').split('/')[1]
+                        print(f"{activity.get('timestamp')}: {item.get('title')} (id: {file_id}) has added to drive.")
+                        try:
+                            permissions = self.drive.permissions().list(fileId=file_id,
+                                                                        fields="permissions(id,type)").execute()
+                            for perm in permissions['permissions']:
+                                if perm['type'] == 'anyone':
+                                    print(f"\033[32m\t\t -- Remove new file {item.get('title')} "
+                                          f"(id: {file_id}) \"anyone\" permission.\033[0m")
+                                    self.drive.permissions().delete(fileId=file_id,
+                                                                    permissionId=perm['id']).execute()
+                        except HttpError as e:
+                            # print(e)
+                            pass
+
+                save_activity_time = int(
+                    datetime.strptime(activities[0].get('timestamp'), "%Y-%m-%dT%H:%M:%S.%fZ").timestamp() * 1000)
+
+                if save_activity_time > self.activity_time:
+                    self.activity_time = save_activity_time
+
+            page_token = results.get("nextPageToken", None)
+            if page_token is None:
+                break
 
 
 gdm: GoogleDriveMonitor = GoogleDriveMonitor()
@@ -155,24 +169,15 @@ class WebHook(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._set_headers(200)
-        length = int(self.headers.get("content-length"))
-        if length:
-            r = self.rfile.read(length)
-            params = parse_qs(r.decode("utf-8"))
-            print(params)
+        # length = int(self.headers.get("content-length"))
+        # if length:
+        #     r = self.rfile.read(length)
+        #     params = parse_qs(r.decode("utf-8"))
+        #     print(params)
 
         # print(str(self.headers))
         if int(self.headers.get('X-Goog-Message-Number')) != 1:
             gdm.review_changes()
-
-        # length = int(self.headers.get("content-length"))
-        # r = self.rfile.read(length)
-        # params = parse_qs(r.decode("utf-8"))
-        # print(params)
-        # a = self.headers.get("X-Goog-Resource-Uri")
-        # params = parse_qs(urlparse(a).query)
-        # if 'pageToken' in params:
-        #     print(params)
 
 
 if __name__ == "__main__":
